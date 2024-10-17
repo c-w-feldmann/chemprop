@@ -2,6 +2,53 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
 
+class LRCalculator:
+    r"""Calculate the learning rate for a given step using a piecewise linear followed by an exponential decay."""
+
+    def __init__(self, warmup_steps: int, cooldown_steps: int, init_lr: float, max_lr: float, final_lr: float):
+        r"""Initialize the learning rate calculator.
+
+        Parameters
+        ----------
+        warmup_steps: int
+            The number of steps during which to linearly increase the learning rate.
+        cooldown_steps: int
+            The number of steps during which to exponential decay the learning rate.
+        init_lr: float
+            The initial learning rate.
+        max_lr: float
+            The maximum learning rate (achieved after ``warmup_steps``).
+        final_lr:
+            The final learning rate (achieved after ``cooldown_steps``).
+        """
+        self.warmup_steps = warmup_steps
+        self.cooldown_steps = cooldown_steps
+        self.init_lr = init_lr
+        self.max_lr = max_lr
+        self.final_lr = final_lr
+
+    def __call__(self, step: int) -> float:
+        r"""Calculate the learning rate for a given step.
+
+        Parameters
+        ----------
+        step: int
+            The step for which to calculate the learning rate.
+
+        Returns
+        -------
+        float
+            The learning rate for the given step
+        """
+        if step < self.warmup_steps:
+            warmup_factor = (self.max_lr - self.init_lr) / self.warmup_steps
+            return step * warmup_factor / self.init_lr + 1
+        if self.warmup_steps <= step < self.warmup_steps + self.cooldown_steps:
+            cooldown_factor = (self.final_lr / self.max_lr) ** (1 / self.cooldown_steps)
+            return (self.max_lr * (cooldown_factor ** (step - self.warmup_steps))) / self.init_lr
+        return self.final_lr / self.init_lr
+
+
 def build_NoamLike_LRSched(
     optimizer: Optimizer,
     warmup_steps: int,
@@ -51,15 +98,5 @@ def build_NoamLike_LRSched(
     ----------
     .. [1] Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A.N., Kaiser, Ł. and Polosukhin, I. "Attention is all you need." Advances in neural information processing systems, 2017, 30. https://arxiv.org/abs/1706.03762
     """
-
-    def lr_lambda(step: int):
-        if step < warmup_steps:
-            warmup_factor = (max_lr - init_lr) / warmup_steps
-            return step * warmup_factor / init_lr + 1
-        elif warmup_steps <= step < warmup_steps + cooldown_steps:
-            cooldown_factor = (final_lr / max_lr) ** (1 / cooldown_steps)
-            return (max_lr * (cooldown_factor ** (step - warmup_steps))) / init_lr
-        else:
-            return final_lr / init_lr
-
+    lr_lambda = LRCalculator(warmup_steps, cooldown_steps, init_lr, max_lr, final_lr)
     return LambdaLR(optimizer, lr_lambda)
