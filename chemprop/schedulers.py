@@ -5,7 +5,9 @@ from torch.optim.lr_scheduler import LambdaLR
 class LRCalculator:
     r"""Calculate the learning rate for a given step using a piecewise linear followed by an exponential decay."""
 
-    def __init__(self, warmup_steps: int, cooldown_steps: int, init_lr: float, max_lr: float, final_lr: float):
+    def __init__(
+        self, warmup_steps: int, cooldown_steps: int, init_lr: float, max_lr: float, final_lr: float
+    ):
         r"""Initialize the learning rate calculator.
 
         Parameters
