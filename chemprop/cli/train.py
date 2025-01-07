@@ -24,7 +24,7 @@ from chemprop.cli.common import (
     process_common_args,
     validate_common_args,
 )
-from chemprop.cli.conf import NOW
+from chemprop.cli.conf import CHEMPROP_TRAIN_DIR, NOW
 from chemprop.cli.utils import (
     LookupAction,
     Subcommand,
@@ -57,6 +57,11 @@ from chemprop.nn.utils import Activation
 from chemprop.utils import Factory
 
 logger = logging.getLogger(__name__)
+
+
+_CV_REMOVAL_ERROR = (
+    "The -k/--num-folds argument was removed in v2.1.0 - use --num-replicates instead."
+)
 
 
 class TrainSubcommand(Subcommand):
@@ -281,9 +286,7 @@ def add_train_args(parser: ArgumentParser) -> ArgumentParser:
 
     extra_mpnn_args = parser.add_argument_group("extra MPNN args")
     extra_mpnn_args.add_argument(
-        "--no-batch-norm",
-        action="store_true",
-        help="Turn off batch normalization after aggregation",
+        "--batch-norm", action="store_true", help="Turn on batch normalization after aggregation"
     )
     extra_mpnn_args.add_argument(
         "--multiclass-num-classes",
@@ -320,6 +323,10 @@ def add_train_args(parser: ArgumentParser) -> ArgumentParser:
         action="store_true",
         help="Turn off caching the featurized ``MolGraph`` s at the beginning of training",
     )
+    train_data_args.add_argument(
+        "--splits-column",
+        help="Name of the column in the input CSV file containing 'train', 'val', or 'test' for each row.",
+    )
     # TODO: Add in v2.1
     # train_data_args.add_argument(
     #     "--spectra-phase-mask-path",
@@ -351,6 +358,9 @@ def add_train_args(parser: ArgumentParser) -> ArgumentParser:
     train_args.add_argument(
         "--eps", type=float, default=1e-8, help="Evidential regularization epsilon"
     )
+    train_args.add_argument(
+        "--alpha", type=float, default=0.1, help="Target error bounds for quantile interval loss"
+    )
     # TODO: Add in v2.1
     # train_args.add_argument(  # TODO: Is threshold the same thing as the spectra target floor? I'm not sure but combined them.
     #     "-T",
@@ -366,6 +376,11 @@ def add_train_args(parser: ArgumentParser) -> ArgumentParser:
         nargs="+",
         action=LookupAction(MetricRegistry),
         help="Specify the evaluation metrics. If unspecified, chemprop will use the following metrics for given dataset types: regression -> ``rmse``, classification -> ``roc``, multiclass -> ``ce`` ('cross entropy'), spectral -> ``sid``. If multiple metrics are provided, the 0-th one will be used for early stopping and checkpointing.",
+    )
+    train_args.add_argument(
+        "--tracking-metric",
+        default="val_loss",
+        help="The metric to track for early stopping and checkpointing. Defaults to the criterion used during training.",
     )
     train_args.add_argument(
         "--show-individual-scores",
@@ -428,13 +443,8 @@ def add_train_args(parser: ArgumentParser) -> ArgumentParser:
         default=0,
         help="Specify the index of the key molecule used for splitting when multiple molecules are present and constrained split_type is used (e.g., ``scaffold_balanced`` or ``random_with_repeated_smiles``). Note that this index begins with zero for the first molecule.",
     )
-    split_args.add_argument(
-        "-k",
-        "--num-folds",
-        type=int,
-        default=1,
-        help="Number of folds when performing cross validation",
-    )
+    split_args.add_argument("--num-replicates", type=int, default=1, help="Number of replicates.")
+    split_args.add_argument("-k", "--num-folds", help=_CV_REMOVAL_ERROR)
     split_args.add_argument(
         "--save-smiles-splits",
         action="store_true",
@@ -445,15 +455,11 @@ def add_train_args(parser: ArgumentParser) -> ArgumentParser:
         type=Path,
         help="Path to a JSON file containing pre-defined splits for the input data, formatted as a list of dictionaries with keys ``train``, ``val``, and ``test`` and values as lists of indices or formatted strings (e.g. [0, 1, 2, 4] or '0-2,4')",
     )
-    train_data_args.add_argument(
-        "--splits-column",
-        help="Name of the column in the input CSV file containing ``train``, ``val``, or ``test`` for each row",
-    )
     split_args.add_argument(
         "--data-seed",
         type=int,
         default=0,
-        help="Specify the random seed to use when splitting data into train/val/test sets. When ``num_folds`` > 1, the first fold uses this seed and all subsequent folds add 1 to the seed (also used for shuffling data in ``build_dataloader`` when ``shuffle`` is True).",
+        help="Specify the random seed to use when splitting data into train/val/test sets. When ``--num-replicates`` > 1, the first replicate uses this seed and all subsequent replicates add 1 to the seed (also used for shuffling data in ``build_dataloader`` when ``shuffle`` is True).",
     )
 
     parser.add_argument(
@@ -467,16 +473,23 @@ def add_train_args(parser: ArgumentParser) -> ArgumentParser:
 
 
 def process_train_args(args: Namespace) -> Namespace:
+    if args.output_dir is None:
+        args.output_dir = CHEMPROP_TRAIN_DIR / args.data_path.stem / NOW
+
+    return args
+
+
+def validate_train_args(args):
     if args.config_path is None and args.data_path is None:
         raise ArgumentError(argument=None, message="Data path must be provided for training.")
+
+    if args.num_folds is not None:  # i.e. user-specified
+        raise ArgumentError(argument=None, message=_CV_REMOVAL_ERROR)
 
     if args.data_path.suffix not in [".csv"]:
         raise ArgumentError(
             argument=None, message=f"Input data must be a CSV file. Got {args.data_path}"
         )
-
-    if args.output_dir is None:
-        args.output_dir = Path(f"chemprop_training/{args.data_path.stem}/{NOW}")
 
     if args.epochs != -1 and args.epochs <= args.warmup_epochs:
         raise ArgumentError(
@@ -520,6 +533,17 @@ def process_train_args(args: Namespace) -> Namespace:
             argument=None, message="Class balance is only applicable for classification tasks."
         )
 
+    valid_tracking_metrics = (
+        args.metrics or [PredictorRegistry[args.task_type]._T_default_metric.alias]
+    ) + ["val_loss"]
+    if args.tracking_metric not in valid_tracking_metrics:
+        raise ArgumentError(
+            argument=None,
+            message=f"Tracking metric must be one of {','.join(valid_tracking_metrics)}. "
+            f"Got {args.tracking_metric}. Additional tracking metric options can be specified with "
+            "the `--metrics` flag.",
+        )
+
     input_cols, target_cols = get_column_names(
         args.data_path,
         args.smiles_columns,
@@ -535,10 +559,6 @@ def process_train_args(args: Namespace) -> Namespace:
     args.target_columns = target_cols
 
     return args
-
-
-def validate_train_args(args):
-    pass
 
 
 def normalize_inputs(train_dset, val_dset, args):
@@ -745,6 +765,7 @@ def build_splits(args, format_kwargs, featurization_kwargs):
         train_indices = [parse_indices(d["train"]) for d in split_idxss]
         val_indices = [parse_indices(d["val"]) for d in split_idxss]
         test_indices = [parse_indices(d["test"]) for d in split_idxss]
+        args.num_replicates = len(split_idxss)
 
     else:
         splitting_data = all_data[args.split_key_molecule]
@@ -753,17 +774,8 @@ def build_splits(args, format_kwargs, featurization_kwargs):
         else:
             splitting_mols = [datapoint.mol for datapoint in splitting_data]
         train_indices, val_indices, test_indices = make_split_indices(
-            splitting_mols, args.split, args.split_sizes, args.data_seed, args.num_folds
+            splitting_mols, args.split, args.split_sizes, args.data_seed, args.num_replicates
         )
-        if not (
-            SplitType.get(args.split) == SplitType.CV_NO_VAL
-            or SplitType.get(args.split) == SplitType.CV
-        ):
-            train_indices, val_indices, test_indices = (
-                [train_indices],
-                [val_indices],
-                [test_indices],
-            )
 
     train_data, val_data, test_data = split_data_by_indices(
         all_data, train_indices, val_indices, test_indices
@@ -778,7 +790,12 @@ def build_splits(args, format_kwargs, featurization_kwargs):
 def summarize(
     target_cols: list[str], task_type: str, dataset: _MolGraphDatasetMixin
 ) -> tuple[list, list]:
-    if task_type in ["regression", "regression-mve", "regression-evidential"]:
+    if task_type in [
+        "regression",
+        "regression-mve",
+        "regression-evidential",
+        "regression-quantile",
+    ]:
         if isinstance(dataset, MulticomponentDataset):
             y = dataset.datasets[0].Y
         else:
@@ -825,7 +842,7 @@ def summarize(
         column_headers = ["Class"] + [f"Count/Percent {target_cols[i]}" for i in range(y.shape[1])]
 
         table_rows = [
-            [f"{k}"] + [f"{class_counts[j,i]}/{class_fracs[j,i]:0.0%}" for j in range(y.shape[1])]
+            [f"{k}"] + [f"{class_counts[j, i]}/{class_fracs[j, i]:0.0%}" for j in range(y.shape[1])]
             for i, k in enumerate(classes)
         ]
 
@@ -837,7 +854,7 @@ def summarize(
 
         return (column_headers, table_rows)
     else:
-        raise ValueError(f"unsupported task type! Task type '{args.task_type}' was not recognized.")
+        raise ValueError(f"unsupported task type! Task type '{task_type}' was not recognized.")
 
 
 def build_table(column_headers: list[str], table_rows: list[str], title: str | None = None) -> str:
@@ -969,6 +986,7 @@ def build_model(
             v_kl=args.v_kl,
             # threshold=args.threshold, TODO: Add in v2.1
             eps=args.eps,
+            alpha=args.alpha,
         )
     else:
         criterion = None
@@ -1000,7 +1018,7 @@ def build_model(
         mp_block,
         agg,
         predictor,
-        not args.no_batch_norm,
+        args.batch_norm,
         metrics,
         args.warmup_epochs,
         args.init_lr,
@@ -1063,16 +1081,25 @@ def train_model(
             model = build_model(args, train_loader.dataset, output_transform, input_transforms)
         logger.info(model)
 
-        monitor_mode = "min" if model.metrics[0].minimize else "max"
-        logger.debug(f"Evaluation metric: '{model.metrics[0].alias}', mode: '{monitor_mode}'")
-
         try:
-            trainer_logger = TensorBoardLogger(model_output_dir, "trainer_logs")
+            trainer_logger = TensorBoardLogger(
+                model_output_dir, "trainer_logs", default_hp_metric=False
+            )
         except ModuleNotFoundError as e:
             logger.warning(
                 f"Unable to import TensorBoardLogger, reverting to CSVLogger (original error: {e})."
             )
             trainer_logger = CSVLogger(model_output_dir, "trainer_logs")
+
+        if args.tracking_metric == "val_loss":
+            T_tracking_metric = model.criterion.__class__
+            tracking_metric = args.tracking_metric
+        else:
+            T_tracking_metric = MetricRegistry[args.tracking_metric]
+            tracking_metric = "val/" + args.tracking_metric
+
+        monitor_mode = "max" if T_tracking_metric.higher_is_better else "min"
+        logger.debug(f"Evaluation metric: '{T_tracking_metric.alias}', mode: '{monitor_mode}'")
 
         if args.remove_checkpoints:
             temp_dir = TemporaryDirectory()
@@ -1080,17 +1107,22 @@ def train_model(
         else:
             checkpoint_dir = model_output_dir
 
+        checkpoint_filename = (
+            f"best-epoch={{epoch}}-{tracking_metric.replace('/', '_')}="
+            f"{{{tracking_metric}:.2f}}"
+        )
         checkpointing = ModelCheckpoint(
             checkpoint_dir / "checkpoints",
-            "best-{epoch}-{val_loss:.2f}",
-            "val_loss",
+            checkpoint_filename,
+            tracking_metric,
             mode=monitor_mode,
             save_last=True,
+            auto_insert_metric_name=False,
         )
 
         if args.epochs != -1:
             patience = args.patience if args.patience is not None else args.epochs
-            early_stopping = EarlyStopping("val_loss", patience=patience, mode=monitor_mode)
+            early_stopping = EarlyStopping(tracking_metric, patience=patience, mode=monitor_mode)
             callbacks = [checkpointing, early_stopping]
         else:
             callbacks = [checkpointing]
@@ -1162,30 +1194,28 @@ def evaluate_and_save_predictions(preds, test_loader, metrics, model_output_dir,
                 preds_slice = torch.from_numpy(preds[:, i : i + 1, :])
                 targets_slice = torch.from_numpy(targets[:, i : i + 1])
             else:
-                preds_slice = torch.from_numpy(preds[:, i])
-                targets_slice = torch.from_numpy(targets[:, i])
+                preds_slice = torch.from_numpy(preds[:, i : i + 1])
+                targets_slice = torch.from_numpy(targets[:, i : i + 1])
             preds_loss = metric(
                 preds_slice,
                 targets_slice,
-                mask[:, i],
+                mask[:, i : i + 1],
                 weights,
                 lt_mask[:, i] if lt_mask is not None else None,
                 gt_mask[:, i] if gt_mask is not None else None,
             )
             individual_scores[metric.alias].append(preds_loss)
 
-    logger.info("Entire Test Set results:")
+    logger.info("Test Set results:")
     for metric in metrics:
         avg_loss = sum(individual_scores[metric.alias]) / len(individual_scores[metric.alias])
-        logger.info(f"entire_test/{metric.alias}: {avg_loss}")
+        logger.info(f"test/{metric.alias}: {avg_loss}")
 
     if args.show_individual_scores:
         logger.info("Entire Test Set individual results:")
         for metric in metrics:
             for i, col in enumerate(args.target_columns):
-                logger.info(
-                    f"entire_test/{col}/{metric.alias}: {individual_scores[metric.alias][i]}"
-                )
+                logger.info(f"test/{col}/{metric.alias}: {individual_scores[metric.alias][i]}")
 
     names = test_loader.dataset.names
     if isinstance(test_loader.dataset, MulticomponentDataset):
@@ -1227,11 +1257,11 @@ def main(args):
 
     splits = build_splits(args, format_kwargs, featurization_kwargs)
 
-    for fold_idx, (train_data, val_data, test_data) in enumerate(zip(*splits)):
-        if args.num_folds == 1:
+    for replicate_idx, (train_data, val_data, test_data) in enumerate(zip(*splits)):
+        if args.num_replicates == 1:
             output_dir = args.output_dir
         else:
-            output_dir = args.output_dir / f"fold_{fold_idx}"
+            output_dir = args.output_dir / f"replicate_{replicate_idx}"
 
         output_dir.mkdir(exist_ok=True, parents=True)
 
