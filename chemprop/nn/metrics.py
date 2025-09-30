@@ -6,6 +6,7 @@ from torch import Tensor
 from torch.nn import functional as F
 import torchmetrics
 from torchmetrics.utilities.compute import auc
+from torchmetrics.utilities.data import dim_zero_cat
 
 from chemprop.utils.registry import ClassRegistry
 
@@ -84,10 +85,11 @@ class ChempropMetric(torchmetrics.Metric):
         Parameters
         ----------
         preds : Tensor
-            a tensor of shape `b x t x u` (regression), `b x t` (binary classification), or
-            `b x t x c` (multiclass classification) containing the predictions, where `b` is the
-            batch size, `t` is the number of tasks to predict, `u` is the number of
-            targets to predict for each task, and `c` is the number of classes.
+            a tensor of shape `b x t x u` (regression with uncertainty), `b x t` (regression without
+            uncertainty and binary classification, except for binary dirichlet), or `b x t x c`
+            (multiclass classification and binary dirichlet) containing the predictions, where `b`
+            is the batch size, `t` is the number of tasks to predict, `u` is the number of values to
+            predict for each task, and `c` is the number of classes.
         targets : Tensor
             a float tensor of shape `b x t` containing the target values
         mask : Tensor
@@ -99,7 +101,11 @@ class ChempropMetric(torchmetrics.Metric):
         gt_mask: Tensor
         """
         mask = torch.ones_like(targets, dtype=torch.bool) if mask is None else mask
-        weights = torch.ones_like(targets, dtype=torch.float) if weights is None else weights
+        weights = (
+            torch.ones(targets.shape[0], dtype=torch.float, device=targets.device)
+            if weights is None
+            else weights
+        )
         lt_mask = torch.zeros_like(targets, dtype=torch.bool) if lt_mask is None else lt_mask
         gt_mask = torch.zeros_like(targets, dtype=torch.bool) if gt_mask is None else gt_mask
 
@@ -291,7 +297,11 @@ class BinaryMCCLoss(ChempropMetric):
         *args,
     ):
         mask = torch.ones_like(targets, dtype=torch.bool) if mask is None else mask
-        weights = torch.ones_like(targets, dtype=torch.float) if weights is None else weights
+        weights = (
+            torch.ones(targets.shape[0], dtype=torch.float, device=targets.device)
+            if weights is None
+            else weights
+        )
 
         if not (0 <= preds.min() and preds.max() <= 1):  # assume logits
             preds = preds.sigmoid()
@@ -312,10 +322,10 @@ class BinaryMCCLoss(ChempropMetric):
         return TP, FP, TN, FN
 
     def compute(self):
-        TP = torch.cat(self.TP, dim=0).sum(0, keepdim=True)
-        FP = torch.cat(self.FP, dim=0).sum(0, keepdim=True)
-        TN = torch.cat(self.TN, dim=0).sum(0, keepdim=True)
-        FN = torch.cat(self.FN, dim=0).sum(0, keepdim=True)
+        TP = dim_zero_cat(self.TP).sum(0)
+        FP = dim_zero_cat(self.FP).sum(0)
+        TN = dim_zero_cat(self.TN).sum(0)
+        FN = dim_zero_cat(self.FN).sum(0)
 
         MCC = (TP * TN - FP * FN) / ((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN) + 1e-8).sqrt()
         MCC = MCC * self.task_weights
@@ -324,6 +334,8 @@ class BinaryMCCLoss(ChempropMetric):
 
 @MetricRegistry.register("binary-mcc")
 class BinaryMCCMetric(BinaryMCCLoss):
+    higher_is_better = True
+
     def compute(self):
         return 1 - super().compute()
 
@@ -349,8 +361,8 @@ class MulticlassMCCLoss(ChempropMetric):
 
         self.add_state("p", default=[], dist_reduce_fx="cat")
         self.add_state("t", default=[], dist_reduce_fx="cat")
-        self.add_state("c", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("s", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("c", default=[], dist_reduce_fx="cat")
+        self.add_state("s", default=[], dist_reduce_fx="cat")
 
     def update(
         self,
@@ -362,7 +374,9 @@ class MulticlassMCCLoss(ChempropMetric):
     ):
         mask = torch.ones_like(targets, dtype=torch.bool) if mask is None else mask
         weights = (
-            torch.ones_like(targets, dtype=torch.float) if weights is None else weights.view(-1, 1)
+            torch.ones((targets.shape[0], 1), dtype=torch.float, device=targets.device)
+            if weights is None
+            else weights.view(-1, 1)
         )
 
         if not (0 <= preds.min() and preds.max() <= 1):  # assume logits
@@ -372,8 +386,8 @@ class MulticlassMCCLoss(ChempropMetric):
 
         self.p += [p]
         self.t += [t]
-        self.c += c
-        self.s += s
+        self.c += [c]
+        self.s += [s]
 
     def _calc_unreduced_loss(self, preds, targets, mask, weights, *args) -> Tensor:
         device = preds.device
@@ -381,27 +395,27 @@ class MulticlassMCCLoss(ChempropMetric):
         bin_targets = torch.eye(C, device=device)[targets]
         bin_preds = torch.eye(C, device=device)[preds.argmax(-1)]
         masked_data_weights = weights.unsqueeze(2) * mask.unsqueeze(2)
-        p = (bin_preds * masked_data_weights).sum(0)
-        t = (bin_targets * masked_data_weights).sum(0)
-        c = (bin_preds * bin_targets * masked_data_weights).sum()
-        s = (preds * masked_data_weights).sum()
+        p = (bin_preds * masked_data_weights).sum(0, keepdims=True)
+        t = (bin_targets * masked_data_weights).sum(0, keepdims=True)
+        c = (bin_preds * bin_targets * masked_data_weights).sum(2).sum(0, keepdims=True)
+        s = (preds * masked_data_weights).sum(2).sum(0, keepdims=True)
 
         return p, t, c, s
 
     def compute(self):
-        p = torch.stack(self.p, dim=-1).sum(-1)
-        t = torch.stack(self.t, dim=-1).sum(-1)
-        c = self.c
-        s = self.s
+        p = dim_zero_cat(self.p).sum(0)
+        t = dim_zero_cat(self.t).sum(0)
+        c = dim_zero_cat(self.c).sum(0)
+        s = dim_zero_cat(self.s).sum(0)
         s2 = s.square()
 
         # the `einsum` calls amount to calculating the batched dot product
-        cov_ytyp = c * s - torch.einsum("ij,ij->i", p, t).sum()
-        cov_ypyp = s2 - torch.einsum("ij,ij->i", p, p).sum()
-        cov_ytyt = s2 - torch.einsum("ij,ij->i", t, t).sum()
+        cov_ytyp = c * s - torch.einsum("ij,ij->i", p, t)
+        cov_ypyp = s2 - torch.einsum("ij,ij->i", p, p)
+        cov_ytyt = s2 - torch.einsum("ij,ij->i", t, t)
 
         x = cov_ypyp * cov_ytyt
-        MCC = torch.tensor(0.0, device=x.device) if x == 0 else cov_ytyp / x.sqrt()
+        MCC = torch.where(x == 0, torch.tensor(0.0), cov_ytyp / x.sqrt())
         MCC = MCC * self.task_weights
 
         return 1 - MCC.mean()
@@ -409,6 +423,8 @@ class MulticlassMCCLoss(ChempropMetric):
 
 @MetricRegistry.register("multiclass-mcc")
 class MulticlassMCCMetric(MulticlassMCCLoss):
+    higher_is_better = True
+
     def compute(self):
         return 1 - super().compute()
 

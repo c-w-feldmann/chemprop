@@ -1,10 +1,12 @@
 from argparse import ArgumentError, ArgumentParser, Namespace
 import logging
 from pathlib import Path
+import sys
 
 from chemprop.cli.utils import LookupAction
 from chemprop.cli.utils.args import uppercase
 from chemprop.featurizers import AtomFeatureMode, MoleculeFeaturizerRegistry, RxnMode
+from chemprop.utils.utils import is_cuikmolmaker_available
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +30,6 @@ def add_common_args(parser: ArgumentParser) -> ArgumentParser:
         action="store_true",
         help="Turn off using the first row in the input CSV as column names",
     )
-
     dataloader_args = parser.add_argument_group("Dataloader args")
     dataloader_args.add_argument(
         "-n",
@@ -75,7 +76,8 @@ def add_common_args(parser: ArgumentParser) -> ArgumentParser:
 
 - ``V1``: Corresponds to the original configuration employed in the Chemprop V1
 - ``V2``: Tailored for a broad range of molecules, this configuration encompasses all elements in the first four rows of the periodic table, along with iodine. It is the default in Chemprop V2.
-- ``ORGANIC``: This configuration is designed specifically for use with organic molecules for drug research and development and includes a subset of elements most common in organic chemistry, including H, B, C, N, O, F, Si, P, S, Cl, Br, and I.""",
+- ``ORGANIC``: This configuration is designed specifically for use with organic molecules for drug research and development and includes a subset of elements most common in organic chemistry, including H, B, C, N, O, F, Si, P, S, Cl, Br, and I.
+- ``RIGR``: Modified V2 (default) featurizer using only the resonance-invariant atom and bond features.""",
     )
     featurization_args.add_argument(
         "--keep-h",
@@ -84,6 +86,16 @@ def add_common_args(parser: ArgumentParser) -> ArgumentParser:
     )
     featurization_args.add_argument(
         "--add-h", action="store_true", help="Whether hydrogens should be added to the mol graph"
+    )
+    data_args.add_argument(
+        "--ignore-stereo",
+        action="store_true",
+        help="Ignore stereochemical information (R/S and Cis/Trans) in the input SMILES",
+    )
+    data_args.add_argument(
+        "--reorder-atoms",
+        action="store_true",
+        help="Reorder atoms in the Chem.Mol object using the specified atom map numbers",
     )
     featurization_args.add_argument(
         "--molecule-featurizers",
@@ -100,6 +112,11 @@ def add_common_args(parser: ArgumentParser) -> ArgumentParser:
         "--descriptors-path",
         type=Path,
         help="Path to extra descriptors to concatenate to learned representation",
+    )
+    featurization_args.add_argument(
+        "--descriptors-columns",
+        nargs="+",
+        help="Column names in the input CSV containing extra datapoint descriptors, like temperature and pressure. See also `--descriptors-path`.",
     )
     # TODO: Add in v2.1
     # featurization_args.add_argument(
@@ -121,29 +138,48 @@ def add_common_args(parser: ArgumentParser) -> ArgumentParser:
         "--no-bond-feature-scaling", action="store_true", help="Turn off extra bond feature scaling"
     )
     featurization_args.add_argument(
+        "--no-bond-descriptor-scaling",
+        action="store_true",
+        help="Turn off extra bond descriptor scaling",
+    )
+    featurization_args.add_argument(
         "--atom-features-path",
         nargs="+",
-        action="append",
-        help="If a single path is given, it is assumed to correspond to the 0-th molecule. Alternatively, it can be a two-tuple of molecule index and path to additional atom features to supply before message passing (e.g., ``--atom-features-path 0 /path/to/features_0.npz``) indicates that the features at the given path should be supplied to the 0-th component. To supply additional features for multiple components, repeat this argument on the command line for each component's respective values (e.g., ``--atom-features-path [...] --atom-features-path [...]``).",
+        action="extend",
+        help="If a single path is given, it is assumed to correspond to the 0-th molecule. Alternatively, it can be a two-tuple of molecule index and path to additional atom features to supply before message passing (e.g., ``--atom-features-path 0 /path/to/features_0.npz``) indicates that the features at the given path should be supplied to the 0-th component. To supply additional features for multiple components, repeat this argument on the command line for each component's respective values (e.g., ``--atom-features-path 0 path_zero --atom-features-path 1 path_one``) or pass each two-tuple in a series (e.g., ``--atom-features-path 0 path_zero 1 path_one``).",
     )
     featurization_args.add_argument(
         "--atom-descriptors-path",
         nargs="+",
-        action="append",
-        help="If a single path is given, it is assumed to correspond to the 0-th molecule. Alternatively, it can be a two-tuple of molecule index and path to additional atom descriptors to supply after message passing (e.g., ``--atom-descriptors-path 0 /path/to/descriptors_0.npz`` indicates that the descriptors at the given path should be supplied to the 0-th component. To supply additional descriptors for multiple components, repeat this argument on the command line for each component's respective values (e.g., ``--atom-descriptors-path [...] --atom-descriptors-path [...]``).",
+        action="extend",
+        help="If a single path is given, it is assumed to correspond to the 0-th molecule. Alternatively, it can be a two-tuple of molecule index and path to additional atom descriptors to supply after message passing (e.g., ``--atom-descriptors-path 0 /path/to/descriptors_0.npz`` indicates that the descriptors at the given path should be supplied to the 0-th component. To supply additional descriptors for multiple components, repeat this argument on the command line for each component's respective values (e.g., ``--atom-descriptors-path 0 path_zero --atom-descriptors-path 1 path_one``) or pass each two-tuple in a series (e.g., ``--atom-descriptors-path 0 path_zero 1 path_one``).",
     )
     featurization_args.add_argument(
         "--bond-features-path",
         nargs="+",
-        action="append",
-        help="If a single path is given, it is assumed to correspond to the 0-th molecule. Alternatively, it can be a two-tuple of molecule index and path to additional bond features to supply before message passing (e.g., ``--bond-features-path 0 /path/to/features_0.npz`` indicates that the features at the given path should be supplied to the 0-th component. To supply additional features for multiple components, repeat this argument on the command line for each component's respective values (e.g., ``--bond-features-path [...] --bond-features-path [...]``).",
+        action="extend",
+        help="If a single path is given, it is assumed to correspond to the 0-th molecule. Alternatively, it can be a two-tuple of molecule index and path to additional bond features to supply before message passing (e.g., ``--bond-features-path 0 /path/to/features_0.npz`` indicates that the features at the given path should be supplied to the 0-th component. To supply additional features for multiple components, repeat this argument on the command line for each component's respective values (e.g., ``--bond-features-path 0 path_zero --bond-features-path 1 path_one``) or pass each two-tuple in a series (e.g., ``--bond-features-path 0 path_zero 1 path_one``).",
     )
-    # TODO: Add in v2.2
-    # parser.add_argument(
-    #     "--constraints-path",
-    #     help="Path to constraints applied to atomic/bond properties prediction.",
-    # )
-
+    featurization_args.add_argument(
+        "--bond-descriptors-path",
+        nargs="+",
+        action="extend",
+        help="Path to additional bond descriptors to use with the learned bond representations after message passing. The file follows the same format as `--atom-descriptors-path`, i.e. the file is created using `np.savez('bond_descriptors.npz', *E_ds)` where `E_ds` is a list of 2D numpy arrays with shape `n_bonds x n_descriptors`.",
+    )
+    parser.add_argument(
+        "--constraints-path",
+        help="Path to a CSV file containing the constraints for atomic/bond properties prediction. The file should have one column for each property being constrained with no SMILES column. The order of the rows should match the order of the SMILES in the input CSV. See also `--constraints-to-targets` for how to specify which constraint applies to which prediction.",
+    )
+    parser.add_argument(
+        "--constraints-to-targets",
+        nargs="+",
+        help="The column names of the atom or bond targets that correspond to each constraint column in the constraints CSV.",
+    )
+    featurization_args.add_argument(
+        "--use-cuikmolmaker-featurization",
+        action="store_true",
+        help="Use ``cuik-molmaker`` package for accelerated atom and bond featurization.",
+    )
     return parser
 
 
@@ -155,42 +191,85 @@ def process_common_args(args: Namespace) -> Namespace:
     #         message="`--features-generators` has been renamed to `--molecule-featurizers`.",
     #     )
 
-    for key in ["atom_features_path", "atom_descriptors_path", "bond_features_path"]:
+    # Bond descriptors are not supported for multi-component, but we treat it like atom descriptors
+    for key in [
+        "atom_features_path",
+        "atom_descriptors_path",
+        "bond_features_path",
+        "bond_descriptors_path",
+    ]:
         inds_paths = getattr(args, key)
 
         if not inds_paths:
             continue
 
-        ind_path_dict = {}
+        if len(inds_paths) == 1:
+            setattr(args, key, {0: Path(inds_paths[0])})
+            continue
 
-        for ind_path in inds_paths:
-            if len(ind_path) > 2:
-                raise ArgumentError(
-                    argument=None,
-                    message="Too many arguments were given for atom features/descriptors or bond features. It should be either a two-tuple of molecule index and a path, or a single path (assumed to be the 0-th molecule).",
-                )
+        if len(inds_paths) % 2 != 0:
+            raise ArgumentError(
+                argument=None,
+                message=f"Invalid argument list for --{key.replace('_', '-')}. It should be either a series of two-tuples of molecule index and a path, or a single path (assumed to be the 0-th molecule). Got {inds_paths}.",
+            )
 
-            if len(ind_path) == 1:
-                ind = 0
-                path = ind_path[0]
-            else:
-                ind, path = ind_path
+        try:
+            inds = [int(ind) for ind in inds_paths[::2]]
+        except ValueError:
+            raise ArgumentError(
+                argument=None,
+                message=f"Invalid argument list for --{key.replace('_', '-')}. It should be either a series of two-tuples of molecule index and a path, or a single path (assumed to be the 0-th molecule). Got {inds_paths}.",
+            )
+        paths = [Path(path) for path in inds_paths[1::2]]
 
-            if ind_path_dict.get(int(ind), None):
-                raise ArgumentError(
-                    argument=None,
-                    message=f"Duplicate atom features/descriptors or bond features given for molecule index {ind}",
-                )
+        if len(set(inds)) != len(inds):
+            raise ArgumentError(
+                argument=None,
+                message=f"Duplicate --{key.replace('_', '-')} received for one of the molecules. Got {inds_paths}.",
+            )
 
-            ind_path_dict[int(ind)] = Path(path)
-
-        setattr(args, key, ind_path_dict)
+        setattr(args, key, {ind: path for ind, path in zip(inds, paths)})
 
     return args
 
 
 def validate_common_args(args):
-    pass
+    if args.use_cuikmolmaker_featurization and not is_cuikmolmaker_available():
+        raise ArgumentError(
+            argument=None,
+            message=f"cuik-molmaker is not installed. Please install it using `python {Path(__file__).parents[1] / Path('scripts/check_and_install_cuik_molmaker.py')}` before using the `--use-cuikmolmaker-featurization` flag.",
+        )
+
+    if args.use_cuikmolmaker_featurization:
+        if args.keep_h:
+            raise ArgumentError(
+                argument=None,
+                message="`--keep-h` is not supported when using cuik-molmaker featurization.",
+            )
+        if args.ignore_stereo:
+            raise ArgumentError(
+                argument=None,
+                message="`--ignore-stereo` is not supported when using cuik-molmaker featurization.",
+            )
+        if args.reorder_atoms:
+            raise ArgumentError(
+                argument=None,
+                message="`--reorder-atoms` is not supported when using cuik-molmaker featurization.",
+            )
+        if args.reaction_columns or (args.smiles_columns and len(args.smiles_columns) > 1):
+            raise ArgumentError(
+                argument=None,
+                message="cuik-molmaker featurization only supports single component molecule datasets.",
+            )
+        if args.molecule_featurizers is not None:
+            logger.warning(
+                "Molecule featurizers reduce the memory savings of `--use-cuikmolmaker-featurization`. Consider pre-computing the features manually and providing them via `--descriptors-path`"
+            )
+
+    if args.num_workers > 0 and (sys.platform == "win32" or sys.platform == "darwin"):
+        logger.warning(
+            "Multiprocessing can hang on Windows and MacOS. Consider using `--num-workers 0` to avoid this issue."
+        )
 
 
 def find_models(model_paths: list[Path]):

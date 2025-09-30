@@ -1,3 +1,4 @@
+import logging
 from typing import Iterable
 
 import torch
@@ -8,6 +9,8 @@ from chemprop.models.model import MPNN
 from chemprop.nn import Aggregation, MulticomponentMessagePassing, Predictor
 from chemprop.nn.metrics import ChempropMetric
 from chemprop.nn.transforms import ScaleTransform
+
+logger = logging.getLogger(__name__)
 
 
 class MulticomponentMPNN(MPNN):
@@ -64,13 +67,34 @@ class MulticomponentMPNN(MPNN):
 
     @classmethod
     def _load(cls, path, map_location, **submodules):
-        d = torch.load(path, map_location, weights_only=False)
+        try:
+            d = torch.load(path, map_location, weights_only=False)
+        except AttributeError:
+            logger.error(
+                f"Model loading failed! It is possible this checkpoint was generated in v2.0 and needs to be converted to v2.1\n Please run 'chemprop convert --conversion v2_0_to_v2_1 -i {path}' and load the converted checkpoint."
+            )
 
         try:
             hparams = d["hyper_parameters"]
             state_dict = d["state_dict"]
         except KeyError:
             raise KeyError(f"Could not find hyper parameters and/or state dict in {path}.")
+
+        if hparams["metrics"] is not None:
+            hparams["metrics"] = [
+                cls._rebuild_metric(metric)
+                if not hasattr(metric, "_defaults")
+                or (not torch.cuda.is_available() and metric.device.type != "cpu")
+                else metric
+                for metric in hparams["metrics"]
+            ]
+
+        if hparams["predictor"]["criterion"] is not None:
+            metric = hparams["predictor"]["criterion"]
+            if not hasattr(metric, "_defaults") or (
+                not torch.cuda.is_available() and metric.device.type != "cpu"
+            ):
+                hparams["predictor"]["criterion"] = cls._rebuild_metric(metric)
 
         hparams["message_passing"]["blocks"] = [
             block_hparams.pop("cls")(**block_hparams)
@@ -81,10 +105,5 @@ class MulticomponentMPNN(MPNN):
             for key in ("message_passing", "agg", "predictor")
             if key not in submodules
         }
-
-        if not hasattr(submodules["predictor"].criterion, "_defaults"):
-            submodules["predictor"].criterion = submodules["predictor"].criterion.__class__(
-                task_weights=submodules["predictor"].criterion.task_weights
-            )
 
         return submodules, state_dict, hparams
