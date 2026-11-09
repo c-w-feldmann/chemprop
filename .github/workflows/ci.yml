@@ -65,7 +65,7 @@ jobs:
       matrix:
         # test on all platforms with both supported versions of Python
         os: [ubuntu-latest, macos-15-intel, windows-2022]
-        python-version: [3.11, 3.12, 3.13]
+        python-version: [3.11, 3.12, 3.13, 3.14]
         exclude:
           - python-version: 3.13
             os: windows-2022
